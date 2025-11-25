@@ -18,7 +18,7 @@
 #include "util.hpp"
 #include "wkb.hpp"
 
-#include <algorithm>
+#include <cmath>
 #include <cassert>
 #include <map>
 #include <unordered_map>
@@ -97,24 +97,37 @@ void follow_chain_and_set_width(
 
     assert(edge.points.size() > 1);
     auto const next_point = edge.points.back();
-    if (node_order.at(next_point) > 1) {
+    if (node_order.at(next_point) > 1) { // It's not an endpoint
         auto const [s, e] =
             std::equal_range(edges->begin(), edges->end(), next_point);
 
-        if (std::next(s) == e) {
-            if (s->width < edge.width) {
+        if (std::next(s) == e) { // Only one downstream edge
+            // Replacement only if child's width is 0/NULL and parent has width
+            if ((s->width == 0.0 || std::isnan(s->width)) && edge.width > 0.0) {
                 s->width = edge.width;
+                // Recurse only if a change was made
                 follow_chain_and_set_width(*s, edges, node_order, seen);
             }
-        } else {
-            for (auto it = s; it != e; ++it) {
-                assert(it->points[0] == next_point);
-                if (it->width < edge.width) {
-                    it->width = edge.width;
-                    auto seen2 = *seen;
-                    follow_chain_and_set_width(*it, edges, node_order, &seen2);
+        } else { // Multiple downstream edges (a split)
+            // Rule 1: Check if ALL children have no width.
+            bool all_children_have_no_width = true;
+            for (auto it_check = s; it_check != e; ++it_check) {
+                if (it_check->width > 0.0) {
+                    all_children_have_no_width = false;
+                    break;
                 }
             }
+
+            // If condition is met, propagate to the first child and recurse ONLY on that path.
+            if (all_children_have_no_width && edge.width > 0.0) {
+                if (s != e) { // Check that there is at least one child
+                    s->width = edge.width;
+                    // Recurse on the updated child. The original `seen` is passed.
+                    follow_chain_and_set_width(*s, edges, node_order, seen);
+                }
+            }
+            // IMPORTANT: No further recursion for other branches in this case,
+            // to prevent the hanging issue. This is the trade-off.
         }
     }
 }
