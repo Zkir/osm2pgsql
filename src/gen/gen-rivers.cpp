@@ -101,6 +101,11 @@ void follow_chain_and_set_width(
         auto const [s, e] =
             std::equal_range(edges->begin(), edges->end(), next_point);
 
+        if (edge.id == 24588515) {
+            log_debug("follow_chain_and_set_width for edge.id={}: edge.width={}, next_point=({}, {}), node_order={}, downstream_edges={}",
+                      edge.id, edge.width, next_point.x(), next_point.y(), node_order.at(next_point), std::distance(s, e));
+        }
+
         if (std::next(s) == e) { // Only one downstream edge
             // Replacement only if child's width is 0/NULL and parent has width
             if ((s->width == 0.0 || std::isnan(s->width)) && edge.width > 0.0) {
@@ -109,25 +114,45 @@ void follow_chain_and_set_width(
                 follow_chain_and_set_width(*s, edges, node_order, seen);
             }
         } else { // Multiple downstream edges (a split)
-            // Rule 1: Check if ALL children have no width.
-            bool all_children_have_no_width = true;
-            for (auto it_check = s; it_check != e; ++it_check) {
-                if (it_check->width > 0.0) {
-                    all_children_have_no_width = false;
+            // Find a downstream edge that is a continuation of the same way.
+            edge_t *continuation = nullptr;
+            for (auto it = s; it != e; ++it) {
+                if (it->id == edge.id) {
+                    continuation = &*it;
                     break;
                 }
             }
 
-            // If condition is met, propagate to the first child and recurse ONLY on that path.
-            if (all_children_have_no_width && edge.width > 0.0) {
-                if (s != e) { // Check that there is at least one child
-                    s->width = edge.width;
-                    // Recurse on the updated child. The original `seen` is passed.
-                    follow_chain_and_set_width(*s, edges, node_order, seen);
+            if (continuation) {
+                // Found a continuation of the same way. Propagate width and
+                // recurse along this path.
+                if ((continuation->width == 0.0 || std::isnan(continuation->width)) && edge.width > 0.0) {
+                    continuation->width = edge.width;
+                    follow_chain_and_set_width(*continuation, edges, node_order, seen);
+                }
+            } else {
+                // No continuation of the same way found. This is a "real"
+                // fork. Fall back to old logic: check if ALL children have
+                // no width.
+                bool all_children_have_no_width = true;
+                for (auto it_check = s; it_check != e; ++it_check) {
+                    if (it_check->width > 0.0) {
+                        all_children_have_no_width = false;
+                        break;
+                    }
+                }
+
+                // If condition is met, propagate to the first child and
+                // recurse ONLY on that path.
+                if (all_children_have_no_width && edge.width > 0.0) {
+                    if (s != e) { // Check that there is at least one child
+                        s->width = edge.width;
+                        // Recurse on the updated child. The original `seen`
+                        // is passed.
+                        follow_chain_and_set_width(*s, edges, node_order, seen);
+                    }
                 }
             }
-            // IMPORTANT: No further recursion for other branches in this case,
-            // to prevent the hanging issue. This is the trade-off.
         }
     }
 }
@@ -142,7 +167,13 @@ void assemble_edge(edge_t *edge, std::vector<edge_t> *edges,
         geom::point_t const next_point = edge->points.back();
 
         auto const count = node_order.at(next_point);
+        if (edge->id == 24588515) {
+            log_debug("assemble_edge for edge->id={}: next_point=({}, {}), node_order={}", edge->id, next_point.x(), next_point.y(), count);
+        }
         if (count != 2) {
+            if (edge->id == 24588515) {
+                log_debug("assemble_edge for edge->id={}: returning because node_order != 2.", edge->id);
+            }
             return;
         }
 
@@ -150,16 +181,25 @@ void assemble_edge(edge_t *edge, std::vector<edge_t> *edges,
             std::equal_range(edges->begin(), edges->end(), next_point);
 
         if (s == e) {
+            if (edge->id == 24588515) {
+                log_debug("assemble_edge for edge->id={}: returning because no matching edge found.", edge->id);
+            }
             return;
         }
         assert(e == std::next(s));
 
         auto const it = s;
         if (it->points.size() == 1 || &*it == edge) {
+            if (edge->id == 24588515) {
+                log_debug("assemble_edge for edge->id={}: returning because found edge is already consumed or is the same.", edge->id);
+            }
             return;
         }
 
         if (it->points[0] != next_point) {
+            if (edge->id == 24588515) {
+                log_debug("assemble_edge for edge->id={}: returning because found edge doesn't start at next_point.", edge->id);
+            }
             return;
         }
         assert(it != edges->end());
@@ -291,6 +331,9 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
                                                f.points.push_back(b);
                                                f.id = id;
                                                f.width = width;
+                                               if (id == 24588515) {
+                                                   log_debug("Way {}: creating segment ({},{}) -> ({},{})", id, a.x(), a.y(), b.x(), b.y());
+                                               }
                                                node_order[a]++;
                                                node_order[b]++;
                                            }
