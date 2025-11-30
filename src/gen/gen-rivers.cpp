@@ -375,28 +375,56 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
             end_point_map[edge.points.back()].push_back(&edge);
         }
 
-        for (auto &current_edge : edges) {
-            auto const parent_it = end_point_map.find(current_edge.points.front());
-
+        // Initialize source nodes with rank 1
+        for (auto &edge : edges) {
+            auto const parent_it = end_point_map.find(edge.points.front());
             if (parent_it == end_point_map.end()) {
-                // Rule 1: No parents
-                current_edge.rank = 1;
-            } else {
+                edge.rank = 1;
+            }
+        }
+
+        bool changed_in_pass = true;
+        int passes = 0;
+        while (changed_in_pass) {
+            changed_in_pass = false;
+            passes++;
+            log_debug("Rank calculation pass {}", passes);
+
+            for (auto &current_edge : edges) {
+                // Skip source nodes, their rank is already 1 and final
+                auto const parent_it = end_point_map.find(current_edge.points.front());
+                if (parent_it == end_point_map.end()) {
+                    continue;
+                }
+
                 auto const &parents = parent_it->second;
+
+                // Check if all parents have had their ranks calculated (rank > 0)
+                bool all_parents_ranked = true;
                 double sum_parent_ranks = 0;
                 for (auto const *parent_edge : parents) {
+                    if (parent_edge->rank == 0) { // Rank 0 means it's not yet calculated
+                        all_parents_ranked = false;
+                        break;
+                    }
                     sum_parent_ranks += parent_edge->rank;
                 }
 
+                if (!all_parents_ranked) {
+                    continue; // Can't calculate rank yet, will try in a later pass
+                }
+
                 // Find siblings. All parents should merge to the same point.
+                // Assuming parents[0] is representative for the junction
                 auto const *first_parent = parents[0];
                 auto const [s, e] = std::equal_range(edges.begin(), edges.end(), first_parent->points.back());
                 
-                auto const num_siblings = std::distance(s, e);
+                auto const num_children_at_fork = std::distance(s, e);
 
-                if (num_siblings <= 1) {
+                double new_rank = 0;
+                if (num_children_at_fork <= 1) {
                     // Rule 2: Single child
-                    current_edge.rank = sum_parent_ranks;
+                    new_rank = sum_parent_ranks;
                 } else {
                     // Rule 3: Multiple children
                     edge_t *max_width_sibling = &*s;
@@ -407,15 +435,21 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
                     }
 
                     if (&current_edge == max_width_sibling) {
-                        // Rule 3b
-                        current_edge.rank = sum_parent_ranks - (num_siblings - 1);
+                        // Rule 3b, with cap at 1
+                        new_rank = std::max(1.0, sum_parent_ranks - num_children_at_fork);
                     } else {
                         // Rule 3a
-                        current_edge.rank = 1;
+                        new_rank = 1;
                     }
+                }
+                
+                if (current_edge.rank != new_rank) {
+                    current_edge.rank = new_rank;
+                    changed_in_pass = true;
                 }
             }
         }
+        log_gen("Rank calculation completed in {} passes.", passes);
     }
     timer(m_timer_rank).stop();
 
