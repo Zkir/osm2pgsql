@@ -37,6 +37,7 @@ private:
     std::size_t m_timer_net;
     std::size_t m_timer_remove;
     std::size_t m_timer_width;
+    std::size_t m_timer_rank;
     std::size_t m_timer_write;
 
     std::size_t m_num_waterways = 0;

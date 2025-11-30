@@ -29,7 +29,7 @@ gen_rivers_t::gen_rivers_t(pg_conn_t *connection, bool append, params_t *params)
   m_timer_prep(add_timer("prep")), m_timer_get(add_timer("get")),
   m_timer_sort(add_timer("sort")), m_timer_net(add_timer("net")),
   m_timer_remove(add_timer("remove")), m_timer_width(add_timer("width")),
-  m_timer_write(add_timer("write"))
+  m_timer_rank(add_timer("rank")), m_timer_write(add_timer("write"))
 {
     check_src_dest_table_params_exist();
 
@@ -57,6 +57,9 @@ struct edge_t
 
     // The width of the river along this edge
     double width = 0.0;
+
+    // The rank of the river segment
+    double rank = 0.0;
 };
 
 bool operator<(edge_t const &a, edge_t const &b) noexcept
@@ -100,11 +103,6 @@ void follow_chain_and_set_width(
     if (node_order.at(next_point) > 1) { // It's not an endpoint
         auto const [s, e] =
             std::equal_range(edges->begin(), edges->end(), next_point);
-
-        if (edge.id == 24588515) {
-            log_debug("follow_chain_and_set_width for edge.id={}: edge.width={}, next_point=({}, {}), node_order={}, downstream_edges={}",
-                      edge.id, edge.width, next_point.x(), next_point.y(), node_order.at(next_point), std::distance(s, e));
-        }
 
         if (std::next(s) == e) { // Only one downstream edge
             // Replacement only if child's width is 0/NULL and parent has width
@@ -167,13 +165,7 @@ void assemble_edge(edge_t *edge, std::vector<edge_t> *edges,
         geom::point_t const next_point = edge->points.back();
 
         auto const count = node_order.at(next_point);
-        if (edge->id == 24588515) {
-            log_debug("assemble_edge for edge->id={}: next_point=({}, {}), node_order={}", edge->id, next_point.x(), next_point.y(), count);
-        }
         if (count != 2) {
-            if (edge->id == 24588515) {
-                log_debug("assemble_edge for edge->id={}: returning because node_order != 2.", edge->id);
-            }
             return;
         }
 
@@ -181,25 +173,16 @@ void assemble_edge(edge_t *edge, std::vector<edge_t> *edges,
             std::equal_range(edges->begin(), edges->end(), next_point);
 
         if (s == e) {
-            if (edge->id == 24588515) {
-                log_debug("assemble_edge for edge->id={}: returning because no matching edge found.", edge->id);
-            }
             return;
         }
         assert(e == std::next(s));
 
         auto const it = s;
         if (it->points.size() == 1 || &*it == edge) {
-            if (edge->id == 24588515) {
-                log_debug("assemble_edge for edge->id={}: returning because found edge is already consumed or is the same.", edge->id);
-            }
             return;
         }
 
         if (it->points[0] != next_point) {
-            if (edge->id == 24588515) {
-                log_debug("assemble_edge for edge->id={}: returning because found edge doesn't start at next_point.", edge->id);
-            }
             return;
         }
         assert(it != edges->end());
@@ -331,9 +314,6 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
                                                f.points.push_back(b);
                                                f.id = id;
                                                f.width = width;
-                                               if (id == 24588515) {
-                                                   log_debug("Way {}: creating segment ({},{}) -> ({},{})", id, a.x(), a.y(), b.x(), b.y());
-                                               }
                                                node_order[a]++;
                                                node_order[b]++;
                                            }
@@ -387,20 +367,72 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
     }
     timer(m_timer_width).stop();
 
+    log_gen("Calculating 'rank' property...");
+    timer(m_timer_rank).start();
+    {
+        std::map<geom::point_t, std::vector<edge_t *>> end_point_map;
+        for (auto &edge : edges) {
+            end_point_map[edge.points.back()].push_back(&edge);
+        }
+
+        for (auto &current_edge : edges) {
+            auto const parent_it = end_point_map.find(current_edge.points.front());
+
+            if (parent_it == end_point_map.end()) {
+                // Rule 1: No parents
+                current_edge.rank = 1;
+            } else {
+                auto const &parents = parent_it->second;
+                double sum_parent_ranks = 0;
+                for (auto const *parent_edge : parents) {
+                    sum_parent_ranks += parent_edge->rank;
+                }
+
+                // Find siblings. All parents should merge to the same point.
+                auto const *first_parent = parents[0];
+                auto const [s, e] = std::equal_range(edges.begin(), edges.end(), first_parent->points.back());
+                
+                auto const num_siblings = std::distance(s, e);
+
+                if (num_siblings <= 1) {
+                    // Rule 2: Single child
+                    current_edge.rank = sum_parent_ranks;
+                } else {
+                    // Rule 3: Multiple children
+                    edge_t *max_width_sibling = &*s;
+                    for (auto it = std::next(s); it != e; ++it) {
+                        if (it->width > max_width_sibling->width) {
+                            max_width_sibling = &*it;
+                        }
+                    }
+
+                    if (&current_edge == max_width_sibling) {
+                        // Rule 3b
+                        current_edge.rank = sum_parent_ranks - (num_siblings - 1);
+                    } else {
+                        // Rule 3a
+                        current_edge.rank = 1;
+                    }
+                }
+            }
+        }
+    }
+    timer(m_timer_rank).stop();
+
     if (append_mode()) {
         dbexec("TRUNCATE {dest}");
     }
 
     log_gen("Writing results to destination table...");
-    dbprepare("ins", "INSERT INTO {dest} ({id_column}, width, name, geom)"
-                     " VALUES ($1::int8, $2::real, $3::text, $4::geometry)");
+    dbprepare("ins", "INSERT INTO {dest} ({id_column}, width, rank, name, geom)"
+                     " VALUES ($1::int8, $2::real, $3::real, $4::text, $5::geometry)");
 
     timer(m_timer_write).start();
     connection().exec("BEGIN");
     for (auto &edge : edges) {
         geom::geometry_t const geom{std::move(edge.points), PROJ_SPHERE_MERC};
         auto const wkb = geom_to_ewkb(geom);
-        connection().exec_prepared("ins", edge.id, edge.width,
+        connection().exec_prepared("ins", edge.id, edge.width, edge.rank,
                                    get_name(names, edge.id),
                                    binary_param_t(wkb));
     }
