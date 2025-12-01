@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cassert>
+#include <limits>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +29,7 @@ gen_rivers_t::gen_rivers_t(pg_conn_t *connection, bool append, params_t *params)
 : gen_base_t(connection, append, params), m_timer_area(add_timer("area")),
   m_timer_prep(add_timer("prep")), m_timer_get(add_timer("get")),
   m_timer_sort(add_timer("sort")), m_timer_net(add_timer("net")),
+  m_timer_break_cycles(add_timer("break_cycles")),
   m_timer_remove(add_timer("remove")), m_timer_width(add_timer("width")),
   m_timer_rank(add_timer("rank")), m_timer_write(add_timer("write"))
 {
@@ -44,44 +46,6 @@ gen_rivers_t::gen_rivers_t(pg_conn_t *connection, bool append, params_t *params)
 }
 
 namespace {
-
-/// The data for a graph edge in the waterway network.
-struct edge_t
-{
-    // All the points in this edge
-    geom::linestring_t points;
-
-    // Edges can be made from (part) of one or more OSM ways, this is the id
-    // of one of them.
-    osmid_t id = 0;
-
-    // The width of the river along this edge
-    double width = 0.0;
-
-    // The rank of the river segment
-    double rank = 0.0;
-};
-
-bool operator<(edge_t const &a, edge_t const &b) noexcept
-{
-    assert(a.points.size() > 1 && b.points.size() > 1);
-    if (a.points[0] == b.points[0]) {
-        return a.points[1] < b.points[1];
-    }
-    return a.points[0] < b.points[0];
-}
-
-bool operator<(edge_t const &a, geom::point_t b) noexcept
-{
-    assert(!a.points.empty());
-    return a.points[0] < b;
-}
-
-bool operator<(geom::point_t a, edge_t const &b) noexcept
-{
-    assert(!b.points.empty());
-    return a < b.points[0];
-}
 
 void follow_chain_and_set_width(
     edge_t const &edge, std::vector<edge_t> *edges,
@@ -217,6 +181,108 @@ std::string const &get_name(
 
 } // anonymous namespace
 
+void gen_rivers_t::break_cycles(std::vector<edge_t> &edges)
+{
+    enum class node_state { white, gray, black };
+
+    std::map<geom::point_t, std::vector<edge_t *>> adj;
+    std::map<geom::point_t, node_state> states;
+
+    for (auto &edge : edges) {
+        if (edge.points.size() > 1) {
+            adj[edge.points.front()].push_back(&edge);
+            states[edge.points.front()] = node_state::white;
+            states[edge.points.back()] = node_state::white;
+        }
+    }
+
+    std::vector<geom::point_t> path;
+
+    std::function<void(geom::point_t const &)> visitor =
+        [&](geom::point_t const &u) {
+        states[u] = node_state::gray;
+        path.push_back(u);
+
+        if (adj.count(u)) {
+            for (auto *edge : adj.at(u)) {
+                if (edge->points.size() < 2) {
+                    continue;
+                }
+                geom::point_t const v = edge->points.back();
+
+                if (states.find(v) == states.end()) {
+                    continue;
+                }
+
+                if (states.at(v) == node_state::gray) {
+                    log_debug("Cycle detected. Analyzing...");
+
+                    auto cycle_start_it = std::find(path.begin(), path.end(), v);
+                    if (cycle_start_it == path.end()) {
+                        continue;
+                    }
+
+                    edge_t *closing_edge = edge;
+                    edge_t *weakest_edge_in_path = nullptr;
+                    double min_width = std::numeric_limits<double>::max();
+
+                    log_debug("--- Cycle Path ---");
+                    for (auto it = cycle_start_it; it != path.end(); ++it) {
+                        geom::point_t const path_node_u = *it;
+                        auto next_it = std::next(it);
+
+                        if (next_it != path.end()) {
+                            geom::point_t const path_node_v = *next_it;
+                            if(adj.count(path_node_u)) {
+                                for(auto *e : adj.at(path_node_u)) {
+                                    if(e->points.back() == path_node_v) {
+                                        log_debug("  - Path edge osm_id={}, width={}", e->id, e->width);
+                                        if (weakest_edge_in_path == nullptr || e->width < min_width) {
+                                            min_width = e->width;
+                                            weakest_edge_in_path = e;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    log_debug("  - Closing edge osm_id={}, width={}", closing_edge->id, closing_edge->width);
+                    log_debug("--------------------");
+
+                    edge_t *weakest_edge = weakest_edge_in_path;
+                    // If all widths are 0, or closing edge is the actual weakest
+                    if (weakest_edge == nullptr || (closing_edge->width <= min_width && closing_edge->points.size() > 1)) {
+                        weakest_edge = closing_edge;
+                    }
+                    
+                    log_debug("  - Selected weakest edge for breaking: osm_id={}, width={}, points.size()={}",
+                              weakest_edge->id, weakest_edge->width, weakest_edge->points.size());
+
+                    if (weakest_edge && weakest_edge->points.size() > 1) {
+                        log_gen("Breaking cycle by removing edge with OSM ID {} and width {}.",
+                                weakest_edge->id, weakest_edge->width);
+                        weakest_edge->points.resize(1);
+                    }
+
+                } else if (states.at(v) == node_state::white) {
+                    visitor(v);
+                }
+            }
+        }
+
+        path.pop_back();
+        states[u] = node_state::black;
+    };
+
+    for (auto const& [node, state] : states) {
+        if (state == node_state::white) {
+            path.clear();
+            visitor(node);
+        }
+    }
+}
+
 /// Get some stats from source table
 void gen_rivers_t::get_stats()
 {
@@ -344,6 +410,11 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
     }
     timer(m_timer_net).stop();
 
+    log_gen("Breaking cycles in river network...");
+    timer(m_timer_break_cycles).start();
+    break_cycles(edges);
+    timer(m_timer_break_cycles).stop();
+
     log_gen("Removing now empty edges...");
     timer(m_timer_remove).start();
     {
@@ -436,7 +507,7 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
 
                     if (&current_edge == max_width_sibling) {
                         // Rule 3b, with cap at 1
-                        new_rank = std::max(1.0, sum_parent_ranks - num_children_at_fork);
+                        new_rank = std::max(1.0, sum_parent_ranks - num_children_at_fork + 1);
                     } else {
                         // Rule 3a
                         new_rank = 1;
