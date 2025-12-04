@@ -145,7 +145,7 @@ void assemble_edge(edge_t *edge, std::vector<edge_t> *edges,
         if (it->points.size() == 1 || &*it == edge) {
             return;
         }
-
+        
         if (it->points[0] != next_point) {
             return;
         }
@@ -357,7 +357,7 @@ UPDATE {src} a SET width = l.width
     timer(m_timer_get).start();
     {
         auto const result = dbexec(R"(
-SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
+SELECT "{id_column}", "{width_column}", "{name_column}", "role", "{geom_column}"
  FROM {src};
 )");
 
@@ -368,7 +368,8 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
             if (!name.empty()) {
                 names.emplace(id, name);
             }
-            auto const geom = ewkb_to_geom(util::decode_hex(result.get(i, 3)));
+            auto const role = result.get(i, 3);
+            auto const geom = ewkb_to_geom(util::decode_hex(result.get(i, 4)));
 
             if (geom.is_linestring()) {
                 auto const &ls = geom.get<geom::linestring_t>();
@@ -380,6 +381,7 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
                                                f.points.push_back(b);
                                                f.id = id;
                                                f.width = width;
+                                               f.role = role;
                                                node_order[a]++;
                                                node_order[b]++;
                                            }
@@ -498,10 +500,30 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
                     new_rank = sum_parent_ranks;
                 } else {
                     // Rule 3: Multiple children
-                    edge_t *max_width_sibling = &*s;
-                    for (auto it = std::next(s); it != e; ++it) {
-                        if (it->width > max_width_sibling->width) {
-                            max_width_sibling = &*it;
+                    // New two-tiered logic to find the main sibling
+                    std::vector<edge_t *> main_stream_siblings;
+                    for (auto it = s; it != e; ++it) {
+                        if (it->role == "main_stream") {
+                            main_stream_siblings.push_back(&*it);
+                        }
+                    }
+
+                    edge_t *max_width_sibling = nullptr;
+                    if (!main_stream_siblings.empty()) {
+                        // Tier 1: A main_stream role exists. Find the widest among them.
+                        max_width_sibling = main_stream_siblings[0];
+                        for (size_t i = 1; i < main_stream_siblings.size(); ++i) {
+                            if (main_stream_siblings[i]->width > max_width_sibling->width) {
+                                max_width_sibling = main_stream_siblings[i];
+                            }
+                        }
+                    } else {
+                        // Tier 2: No main_stream role. Fall back to widest among all children.
+                        max_width_sibling = &*s;
+                        for (auto it = std::next(s); it != e; ++it) {
+                            if (it->width > max_width_sibling->width) {
+                                max_width_sibling = &*it;
+                            }
                         }
                     }
 
@@ -529,8 +551,8 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
     }
 
     log_gen("Writing results to destination table...");
-    dbprepare("ins", "INSERT INTO {dest} ({id_column}, width, rank, name, geom)"
-                     " VALUES ($1::int8, $2::real, $3::real, $4::text, $5::geometry)");
+    dbprepare("ins", "INSERT INTO {dest} ({id_column}, width, rank, name, role, geom)"
+                     " VALUES ($1::int8, $2::real, $3::real, $4::text, $5::text, $6::geometry)");
 
     timer(m_timer_write).start();
     connection().exec("BEGIN");
@@ -538,7 +560,7 @@ SELECT "{id_column}", "{width_column}", "{name_column}", "{geom_column}"
         geom::geometry_t const geom{std::move(edge.points), PROJ_SPHERE_MERC};
         auto const wkb = geom_to_ewkb(geom);
         connection().exec_prepared("ins", edge.id, edge.width, edge.rank,
-                                   get_name(names, edge.id),
+                                   get_name(names, edge.id), edge.role,
                                    binary_param_t(wkb));
     }
     connection().exec("COMMIT");

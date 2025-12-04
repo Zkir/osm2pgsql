@@ -15,6 +15,7 @@
 #include "osmtypes.hpp"
 
 #include <cstddef>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -36,6 +37,9 @@ struct edge_t
 
     // The rank of the river segment
     double rank = 0.0;
+
+    // The role of the waterway (e.g. 'main_stream')
+    std::string role;
 };
 
 inline bool operator<(edge_t const &a, edge_t const &b) noexcept
